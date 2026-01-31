@@ -105,9 +105,48 @@ if (!submitButton) {
   await submitButton.click();
 }
     
-    // Wait for navigation after login
-    console.log('Waiting for login...');
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+  // Wait for navigation after login OR wait for error message
+console.log('Waiting for login...');
+try {
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
+    page.waitForSelector('.error, .alert, [class*="error"], [class*="alert"]', { timeout: 15000 })
+  ]);
+} catch (err) {
+  // Check if we're still on login page or if there's an error
+  console.log('Checking current URL...');
+  const currentUrl = page.url();
+  console.log('Current URL:', currentUrl);
+  
+  // Take screenshot to see what happened
+  await page.screenshot({ path: '/tmp/plaud-after-submit.png' });
+  
+  // Check for error messages
+  const errorMessage = await page.evaluate(() => {
+    const errorEl = document.querySelector('.error, .alert, [class*="error"], [class*="alert"]');
+    return errorEl ? errorEl.textContent : null;
+  });
+  
+  if (errorMessage) {
+    throw new Error(`Login failed: ${errorMessage}`);
+  }
+  
+  // If URL changed, we might be logged in
+  if (!currentUrl.includes('/login')) {
+    console.log('URL changed, assuming login successful');
+  } else {
+    throw new Error('Login failed - still on login page. Please check credentials.');
+  }
+}
+
+console.log('Login successful, waiting for recordings...');
+
+// Wait for recordings to load
+await page.waitForTimeout(5000);
+
+// Get current URL to verify we're on the right page
+const recordingsUrl = page.url();
+console.log('Current page:', recordingsUrl);
     
     // Take screenshot after login
     await page.screenshot({ path: '/tmp/plaud-after-login.png' });
@@ -116,57 +155,98 @@ if (!submitButton) {
     // Wait for recordings to load
     await page.waitForTimeout(5000);
     
-    // Extract recordings data
-    console.log('Extracting recordings...');
-    const recordings = await page.evaluate(() => {
-      const recordingElements = document.querySelectorAll('[data-recording], .recording-item, .file-item, .note-item, [class*="recording"], [class*="file"]');
-      const results = [];
-      
-      recordingElements.forEach((element) => {
-        try {
-          // Try to extract title
-          const titleElement = element.querySelector('.title, .recording-title, h3, h4, .name, [class*="title"]');
-          const title = titleElement ? titleElement.innerText.trim() : 'Untitled Recording';
-          
-          // Try to extract date
-          const dateElement = element.querySelector('.date, .time, .timestamp, time, [class*="date"], [class*="time"]');
-          const dateText = dateElement ? dateElement.innerText.trim() : new Date().toISOString();
-          
-          // Try to extract summary/transcription
-          const summaryElement = element.querySelector('.summary, .description, .content, .transcript, [class*="summary"], [class*="description"]');
-          const summary = summaryElement ? summaryElement.innerText.trim() : '';
-          
-          // Generate a unique ID
-          const id = element.getAttribute('data-id') || 
-                     element.getAttribute('id') || 
-                     `${title}-${dateText}`.replace(/[^a-zA-Z0-9]/g, '-');
-          
-          if (title && title !== 'Untitled Recording') {
-            results.push({
-              id,
-              title,
-              date: dateText,
-              summary: summary || 'No summary available'
-            });
-          }
-        } catch (err) {
-          console.error('Error extracting recording:', err);
-        }
-      });
-      
-      return results;
-    });
-    
-    console.log(`Found ${recordings.length} recordings`);
-    return recordings;
-    
-  } catch (error) {
-    console.error('Error scraping Plaud:', error);
-    throw error;
-  } finally {
-    await browser.close();
+ // Extract recordings data
+console.log('Extracting recordings...');
+
+// First, let's see what's actually on the page
+const pageContent = await page.evaluate(() => {
+  return {
+    url: window.location.href,
+    title: document.title,
+    bodyText: document.body.innerText.substring(0, 500) // First 500 chars
+  };
+});
+
+console.log('Page info:', JSON.stringify(pageContent, null, 2));
+
+const recordings = await page.evaluate(() => {
+  const results = [];
+  
+  // Try multiple selector strategies
+  const selectors = [
+    '[data-recording]',
+    '.recording-item',
+    '.file-item',
+    '.note-item',
+    '[class*="recording"]',
+    '[class*="file"]',
+    '[class*="note"]',
+    'li[class*="item"]',
+    'div[class*="card"]',
+    'div[class*="list"] > div'
+  ];
+  
+  let recordingElements = [];
+  for (const selector of selectors) {
+    const elements = document.querySelectorAll(selector);
+    if (elements.length > 0) {
+      console.log(`Found ${elements.length} elements with selector: ${selector}`);
+      recordingElements = Array.from(elements);
+      break;
+    }
   }
+  
+  if (recordingElements.length === 0) {
+    console.log('No recording elements found with any selector');
+    return [];
+  }
+  
+  recordingElements.forEach((element, index) => {
+    try {
+      // Extract all text content
+      const allText = element.innerText || element.textContent || '';
+      
+      // Try to extract title
+      const titleElement = element.querySelector('.title, .recording-title, h3, h4, .name, [class*="title"], [class*="name"]');
+      const title = titleElement ? titleElement.innerText.trim() : 
+                   allText.split('\n')[0].trim() || `Recording ${index + 1}`;
+      
+      // Try to extract date
+      const dateElement = element.querySelector('.date, .time, .timestamp, time, [class*="date"], [class*="time"]');
+      const dateText = dateElement ? dateElement.innerText.trim() : new Date().toISOString();
+      
+      // Try to extract summary/transcription
+      const summaryElement = element.querySelector('.summary, .description, .content, .transcript, [class*="summary"], [class*="description"]');
+      const summary = summaryElement ? summaryElement.innerText.trim() : allText.substring(0, 500);
+      
+      // Generate a unique ID
+      const id = element.getAttribute('data-id') || 
+                 element.getAttribute('id') || 
+                 `recording-${Date.now()}-${index}`;
+      
+      if (title && title.length > 0) {
+        results.push({
+          id,
+          title,
+          date: dateText,
+          summary: summary || 'No summary available'
+        });
+      }
+    } catch (err) {
+      console.error('Error extracting recording:', err);
+    }
+  });
+  
+  return results;
+});
+
+console.log(`Found ${recordings.length} recordings`);
+
+if (recordings.length > 0) {
+  console.log('Sample recording:', JSON.stringify(recordings[0], null, 2));
 }
+
+return recordings;
 /**
  * Create a Notion page for a recording
  */
