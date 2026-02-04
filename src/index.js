@@ -1,348 +1,396 @@
-import { Client } from '@notionhq/client';
-import puppeteer from 'puppeteer';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+import puppeteer from "puppeteer";
+import { Client } from "@notionhq/client";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configuration from environment variables
-const PLAUD_EMAIL = process.env.PLAUD_EMAIL;
-const PLAUD_PASSWORD = process.env.PLAUD_PASSWORD;
-const NOTION_API_KEY = process.env.NOTION_API_KEY;
-const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) throw new Error(`Missing required environment variable: ${name}`);
+  return String(v).trim();
+}
 
-// File to track synced recordings
-const SYNC_HISTORY_FILE = path.join(__dirname, '../synced-recordings.json');
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-// Initialize Notion client
-const notion = new Client({ auth: NOTION_API_KEY });
-
-/**
- * Load sync history to avoid duplicates
- */
-function loadSyncHistory() {
+async function safeJson(response) {
   try {
-    if (fs.existsSync(SYNC_HISTORY_FILE)) {
-      const data = fs.readFileSync(SYNC_HISTORY_FILE, 'utf8');
-      return JSON.parse(data);
-    }
-  } catch (error) {
-    console.log('No sync history found, starting fresh');
+    return await response.json();
+  } catch {
+    return null;
   }
-  return { syncedIds: [] };
 }
 
-/**
- * Save sync history
- */
-function saveSyncHistory(history) {
-  fs.writeFileSync(SYNC_HISTORY_FILE, JSON.stringify(history, null, 2));
+function normalizeDbId(input) {
+  // Accepts raw 32 char id, or id with dashes
+  const v = String(input).trim();
+  const onlyHex = v.replace(/-/g, "");
+  return onlyHex;
 }
 
-/**
- * Login to Plaud and scrape recordings
- */
-async function getPlaudRecordings() {
-  console.log('Launching browser...');
+async function loadSyncedIds() {
+  const fp = path.join(process.cwd(), "synced-recordings.json");
+  try {
+    const raw = await fs.readFile(fp, "utf8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return new Set(parsed.map(String));
+    if (parsed && Array.isArray(parsed.ids)) return new Set(parsed.ids.map(String));
+    return new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+async function saveSyncedIds(setOfIds) {
+  const fp = path.join(process.cwd(), "synced-recordings.json");
+  const ids = Array.from(setOfIds);
+  await fs.writeFile(fp, JSON.stringify(ids, null, 2) + "\n", "utf8");
+}
+
+async function waitForAnySelector(page, selectors, timeoutMs = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const sel of selectors) {
+      const el = await page.$(sel);
+      if (el) return { selector: sel, element: el };
+    }
+    await sleep(250);
+  }
+  throw new Error(`Timed out waiting for selectors: ${selectors.join(", ")}`);
+}
+
+async function typeInto(page, selectors, value) {
+  const { element } = await waitForAnySelector(page, selectors, 20000);
+  await element.click({ clickCount: 3 });
+  await page.keyboard.type(value, { delay: 20 });
+}
+
+async function loginToPlaud(page, baseUrl, email, password) {
+  console.log("Navigating to Plaud login...");
+  await page.goto(baseUrl, { waitUntil: "networkidle2" });
+
+  // Some apps land on home then redirect to login. Give it a moment.
+  await sleep(1000);
+
+  // Email field
+  console.log("Waiting for email input...");
+  await typeInto(
+    page,
+    [
+      'input[type="email"]',
+      'input[name="email"]',
+      'input[autocomplete="email"]',
+      'input[placeholder*="email" i]',
+    ],
+    email
+  );
+
+  // Password field
+  console.log("Waiting for password input...");
+  await typeInto(
+    page,
+    [
+      'input[type="password"]',
+      'input[name="password"]',
+      'input[autocomplete="current-password"]',
+      'input[placeholder*="password" i]',
+    ],
+    password
+  );
+
+  // Submit without relying on a button selector
+  console.log("Submitting login...");
+  await page.keyboard.press("Enter");
+
+  // Wait for either navigation or a clear post login signal
+  // We do a race: either URL changes, or a known logged in element appears
+  const loggedInSelectors = [
+    'a[href*="record" i]',
+    'a[href*="note" i]',
+    'button[aria-label*="profile" i]',
+    '[data-testid*="user" i]',
+  ];
+
+  try {
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 45000 }),
+      (async () => {
+        await waitForAnySelector(page, loggedInSelectors, 45000);
+      })(),
+    ]);
+  } catch {
+    // Not fatal yet. We will check for login failure.
+  }
+
+  // Detect obvious login failure messages
+  const bodyText = await page.evaluate(() => document.body?.innerText || "");
+  const lower = bodyText.toLowerCase();
+  if (lower.includes("incorrect") || lower.includes("invalid") || lower.includes("wrong password")) {
+    throw new Error("Plaud login appears to have failed. Check PLAUD_EMAIL and PLAUD_PASSWORD.");
+  }
+
+  console.log("Login step completed. Proceeding...");
+}
+
+function extractRecordingsFromApiJson(json) {
+  // We do not know Plaud schema exactly, so we check common shapes.
+  // Return array of { id, title, createdAt, summary, sourceUrl, transcript }
+  if (!json || typeof json !== "object") return [];
+
+  const candidates = [];
+
+  const maybeArrays = [];
+  for (const k of Object.keys(json)) {
+    if (Array.isArray(json[k])) maybeArrays.push(json[k]);
+  }
+  // Common nesting patterns
+  if (Array.isArray(json.recordings)) maybeArrays.push(json.recordings);
+  if (Array.isArray(json.data)) maybeArrays.push(json.data);
+  if (json.data && Array.isArray(json.data.recordings)) maybeArrays.push(json.data.recordings);
+  if (json.result && Array.isArray(json.result.recordings)) maybeArrays.push(json.result.recordings);
+
+  for (const arr of maybeArrays) {
+    for (const r of arr) {
+      if (!r || typeof r !== "object") continue;
+      const id = r.id ?? r.recordingId ?? r.uuid ?? r._id;
+      if (!id) continue;
+
+      const title = r.title ?? r.name ?? r.recordingName ?? "Plaud Recording";
+      const createdAt = r.createdAt ?? r.created_at ?? r.time ?? r.date ?? null;
+      const summary = r.summary ?? r.brief ?? r.aiSummary ?? "";
+      const transcript = r.transcript ?? r.text ?? r.content ?? "";
+      const sourceUrl = r.url ?? r.webUrl ?? r.shareUrl ?? "";
+
+      candidates.push({
+        id: String(id),
+        title: String(title),
+        createdAt,
+        summary: summary ? String(summary) : "",
+        transcript: transcript ? String(transcript) : "",
+        sourceUrl: sourceUrl ? String(sourceUrl) : "",
+      });
+    }
+  }
+
+  // Deduplicate by id
+  const map = new Map();
+  for (const c of candidates) map.set(c.id, c);
+  return Array.from(map.values());
+}
+
+async function getPlaudRecordings(page) {
+  console.log("Opening Plaud app area...");
+  // Try to nudge app to a recordings area. We do not assume exact route.
+  // Most apps expose something like /recordings or /notes. We attempt both.
+  const current = page.url();
+  const base = new URL(current);
+  const tryUrls = [
+    new URL("/recordings", base).toString(),
+    new URL("/notes", base).toString(),
+    new URL("/app", base).toString(),
+  ];
+
+  let recordings = [];
+  const apiPayloads = [];
+
+  page.on("response", async (resp) => {
+    const url = resp.url();
+    // Heuristic: capture api responses that look like they contain recordings list
+    if (!/api|record|note|transcript|meeting/i.test(url)) return;
+    const json = await safeJson(resp);
+    if (!json) return;
+
+    const extracted = extractRecordingsFromApiJson(json);
+    if (extracted.length) {
+      apiPayloads.push(...extracted);
+    }
+  });
+
+  for (const u of tryUrls) {
+    try {
+      await page.goto(u, { waitUntil: "networkidle2" });
+      // Give network listeners time to capture
+      await sleep(2000);
+      recordings = apiPayloads;
+      if (recordings.length) break;
+    } catch {
+      // Try next
+    }
+  }
+
+  if (recordings.length) {
+    console.log(`Captured ${recordings.length} recordings from Plaud network responses.`);
+    return recordings;
+  }
+
+  // Fallback: basic DOM scrape for cards
+  console.log("Falling back to DOM scrape...");
+  await sleep(1500);
+
+  const domResults = await page.evaluate(() => {
+    const results = [];
+
+    const pickText = (el) => (el && el.textContent ? el.textContent.trim() : "");
+
+    // Try to find likely cards
+    const cards = Array.from(document.querySelectorAll("[class*='card' i], [data-testid*='card' i]"));
+    for (const card of cards) {
+      const titleEl =
+        card.querySelector("h1, h2, h3") ||
+        card.querySelector("[class*='title' i]") ||
+        card.querySelector("[data-testid*='title' i]");
+      const title = pickText(titleEl) || "Plaud Recording";
+
+      const idAttr =
+        card.getAttribute("data-id") ||
+        card.getAttribute("data-recording-id") ||
+        card.getAttribute("data-testid") ||
+        "";
+
+      // Pull any obvious summary block
+      const summaryEl =
+        card.querySelector("[class*='summary' i]") ||
+        card.querySelector("[data-testid*='summary' i]") ||
+        null;
+      const summary = pickText(summaryEl);
+
+      results.push({
+        id: idAttr || title, // weak fallback
+        title,
+        createdAt: null,
+        summary,
+        transcript: "",
+        sourceUrl: "",
+      });
+    }
+
+    // Deduplicate
+    const map = new Map();
+    for (const r of results) map.set(String(r.id), r);
+    return Array.from(map.values()).slice(0, 100);
+  });
+
+  if (!domResults.length) {
+    throw new Error("Could not find recordings from Plaud. Plaud UI likely changed. We need to adjust selectors.");
+  }
+
+  console.log(`DOM scrape found ${domResults.length} potential recordings.`);
+  return domResults;
+}
+
+function toNotionDate(value) {
+  // Try to coerce into ISO date
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+async function writeRecordingToNotion(notion, databaseId, rec) {
+  // This expects a Notion database that has these properties:
+  // Name (title), Date (date), Summary (rich_text), Source (rich_text or url)
+  // If yours differs, we can adapt it.
+  const props = {
+    Name: {
+      title: [{ type: "text", text: { content: rec.title || "Plaud Recording" } }],
+    },
+  };
+
+  const iso = toNotionDate(rec.createdAt);
+  if (iso) {
+    props.Date = { date: { start: iso } };
+  }
+
+  if (rec.summary) {
+    props.Summary = { rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }] };
+  }
+
+  // Source can be stored as rich text if you have that property, or url if you set it that way.
+  // We default to rich_text because it is most common.
+  if (rec.sourceUrl || rec.id) {
+    const sourceText = rec.sourceUrl || `Plaud:${rec.id}`;
+    props.Source = { rich_text: [{ type: "text", text: { content: sourceText.slice(0, 1900) } }] };
+  }
+
+  const children = [];
+  if (rec.transcript) {
+    children.push({
+      object: "block",
+      type: "heading_2",
+      heading_2: { rich_text: [{ type: "text", text: { content: "Transcript" } }] },
+    });
+    // Notion block text limit is strict, chunk it
+    const t = rec.transcript;
+    const chunkSize = 1800;
+    for (let i = 0; i < t.length; i += chunkSize) {
+      children.push({
+        object: "block",
+        type: "paragraph",
+        paragraph: { rich_text: [{ type: "text", text: { content: t.slice(i, i + chunkSize) } }] },
+      });
+      if (children.length > 90) break;
+    }
+  }
+
+  await notion.pages.create({
+    parent: { database_id: databaseId },
+    properties: props,
+    children: children.length ? children : undefined,
+  });
+}
+
+async function main() {
+  console.log("Starting Plaud -> Notion sync...");
+
+  const plaudEmail = requireEnv("PLAUD_EMAIL");
+  const plaudPassword = requireEnv("PLAUD_PASSWORD");
+  const notionApiKey = requireEnv("NOTION_API_KEY");
+  const notionDatabaseId = normalizeDbId(requireEnv("NOTION_DATABASE_ID"));
+
+  const baseUrl = process.env.PLAUD_BASE_URL ? String(process.env.PLAUD_BASE_URL).trim() : "https://web.plaud.ai";
+
+  const synced = await loadSyncedIds();
+  console.log(`Previously synced: ${synced.size} recordings`);
+
   const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   try {
     const page = await browser.newPage();
-    
-    // Navigate to Plaud login
-    console.log('Navigating to Plaud login...');
-    await page.goto('https://web.plaud.ai/login', { waitUntil: 'networkidle2' });
-    
-    console.log('Login page loaded');
-    
-    // Wait for login form
-    console.log('Waiting for email input...');
-    await page.waitForSelector('input[type="email"], input[type="text"], input[name="email"]', { timeout: 10000 });
-    
-    // Enter email
-    console.log('Entering email...');
-    const emailInput = await page.$('input[type="email"], input[type="text"], input[name="email"]');
-    await emailInput.type(PLAUD_EMAIL);
-    
+    page.setDefaultTimeout(60000);
 
+    await loginToPlaud(page, baseUrl, plaudEmail, plaudPassword);
 
-    if (!submitButton) {
-      // Try to find button by text content
-      console.log('Trying to find button by text...');
-      const buttons = await page.$$('button');
-      for (const button of buttons) {
-        const text = await page.evaluate(el => el.textContent, button);
-        if (text && (text.toLowerCase().includes('sign in') || 
-                     text.toLowerCase().includes('log in') || 
-                     text.toLowerCase().includes('login') ||
-                     text.toLowerCase().includes('submit'))) {
-          submitButton = button;
-          break;
-        }
-      }
+    const recordings = await getPlaudRecordings(page);
+
+    const notion = new Client({ auth: notionApiKey });
+
+    let created = 0;
+    for (const rec of recordings) {
+      if (!rec?.id) continue;
+      if (synced.has(String(rec.id))) continue;
+
+      console.log(`Writing to Notion: ${rec.title} (${rec.id})`);
+      await writeRecordingToNotion(notion, notionDatabaseId, rec);
+      synced.add(String(rec.id));
+      created += 1;
     }
 
-    if (!submitButton) {
-      console.log('Submit button not found, pressing Enter...');
-      await passwordInput.press('Enter');
-    } else {
-      console.log('Clicking submit button...');
-      await submitButton.click();
-    }
-    
-    // Wait for navigation after login OR wait for error message
-    console.log('Waiting for login...');
-    try {
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
-        page.waitForSelector('.error, .alert, [class*="error"], [class*="alert"]', { timeout: 15000 })
-      ]);
-    } catch (err) {
-      // Check if we're still on login page or if there's an error
-      console.log('Checking current URL...');
-      const currentUrl = page.url();
-      console.log('Current URL:', currentUrl);
-      
-      // Check for error messages
-      const errorMessage = await page.evaluate(() => {
-        const errorEl = document.querySelector('.error, .alert, [class*="error"], [class*="alert"]');
-        return errorEl ? errorEl.textContent : null;
-      });
-      
-      if (errorMessage) {
-        throw new Error(`Login failed: ${errorMessage}`);
-      }
-      
-      // If URL changed, we might be logged in
-      if (!currentUrl.includes('/login')) {
-        console.log('URL changed, assuming login successful');
-      } else {
-        throw new Error('Login failed - still on login page. Please check credentials and ensure Private Cloud Sync is enabled in Plaud app.');
-      }
-    }
-    
-    console.log('Login successful, waiting for recordings...');
-    
-    // Wait for recordings to load
-    await page.waitForTimeout(5000);
-    
-    // Get current URL to verify we're on the right page
-    const recordingsUrl = page.url();
-    console.log('Current page:', recordingsUrl);
-    
-    // Extract recordings data
-    console.log('Extracting recordings...');
-    
-    // First, let's see what's actually on the page
-    const pageContent = await page.evaluate(() => {
-      return {
-        url: window.location.href,
-        title: document.title,
-        bodyText: document.body.innerText.substring(0, 500)
-      };
-    });
-    
-    console.log('Page info:', JSON.stringify(pageContent, null, 2));
-    
-    const recordings = await page.evaluate(() => {
-      const results = [];
-      
-      // Try multiple selector strategies
-      const selectors = [
-        '[data-recording]',
-        '.recording-item',
-        '.file-item',
-        '.note-item',
-        '[class*="recording"]',
-        '[class*="file"]',
-        '[class*="note"]',
-        'li[class*="item"]',
-        'div[class*="card"]',
-        'div[class*="list"] > div'
-      ];
-      
-      let recordingElements = [];
-      for (const selector of selectors) {
-        const elements = document.querySelectorAll(selector);
-        if (elements.length > 0) {
-          console.log(`Found ${elements.length} elements with selector: ${selector}`);
-          recordingElements = Array.from(elements);
-          break;
-        }
-      }
-      
-      if (recordingElements.length === 0) {
-        console.log('No recording elements found with any selector');
-        return [];
-      }
-      
-      recordingElements.forEach((element, index) => {
-        try {
-          // Extract all text content
-          const allText = element.innerText || element.textContent || '';
-          
-          // Try to extract title
-          const titleElement = element.querySelector('.title, .recording-title, h3, h4, .name, [class*="title"], [class*="name"]');
-          const title = titleElement ? titleElement.innerText.trim() : 
-                       allText.split('\n')[0].trim() || `Recording ${index + 1}`;
-          
-          // Try to extract date
-          const dateElement = element.querySelector('.date, .time, .timestamp, time, [class*="date"], [class*="time"]');
-          const dateText = dateElement ? dateElement.innerText.trim() : new Date().toISOString();
-          
-          // Try to extract summary/transcription
-          const summaryElement = element.querySelector('.summary, .description, .content, .transcript, [class*="summary"], [class*="description"]');
-          const summary = summaryElement ? summaryElement.innerText.trim() : allText.substring(0, 500);
-          
-          // Generate a unique ID
-          const id = element.getAttribute('data-id') || 
-                     element.getAttribute('id') || 
-                     `recording-${Date.now()}-${index}`;
-          
-          if (title && title.length > 0) {
-            results.push({
-              id,
-              title,
-              date: dateText,
-              summary: summary || 'No summary available'
-            });
-          }
-        } catch (err) {
-          console.error('Error extracting recording:', err);
-        }
-      });
-      
-      return results;
-    });
-    
-    console.log(`Found ${recordings.length} recordings`);
-    
-    if (recordings.length > 0) {
-      console.log('Sample recording:', JSON.stringify(recordings[0], null, 2));
-    }
-    
-    return recordings;
-    
-  } catch (error) {
-    console.error('Error scraping Plaud:', error);
-    throw error;
+    await saveSyncedIds(synced);
+
+    console.log(`Done. Created ${created} new Notion pages.`);
   } finally {
     await browser.close();
   }
 }
 
-/**
- * Create a Notion page for a recording
- */
-async function createNotionPage(recording) {
-  try {
-    // Parse the date
-    let recordingDate;
-    try {
-      recordingDate = new Date(recording.date).toISOString();
-    } catch {
-      recordingDate = new Date().toISOString();
-    }
-    
-    const response = await notion.pages.create({
-      parent: {
-        database_id: NOTION_DATABASE_ID,
-      },
-      properties: {
-        'Name': {
-          title: [
-            {
-              text: {
-                content: recording.title,
-              },
-            },
-          ],
-        },
-        'Date': {
-          date: {
-            start: recordingDate,
-          },
-        },
-        'Summary': {
-          rich_text: [
-            {
-              text: {
-                content: recording.summary.substring(0, 2000),
-              },
-            },
-          ],
-        },
-        'Source': {
-          select: {
-            name: 'Plaud',
-          },
-        },
-      },
-    });
-    
-    console.log(`✅ Created Notion page: ${recording.title}`);
-    return response;
-  } catch (error) {
-    console.error(`❌ Error creating Notion page for "${recording.title}":`, error.message);
-    throw error;
-  }
-}
-
-/**
- * Main sync function
- */
-async function syncPlaudToNotion() {
-  console.log('🚀 Starting Plaud → Notion sync...\n');
-  
-  // Validate environment variables
-  if (!PLAUD_EMAIL || !PLAUD_PASSWORD || !NOTION_API_KEY || !NOTION_DATABASE_ID) {
-    throw new Error('Missing required environment variables. Please check your GitHub secrets.');
-  }
-  
-  // Load sync history
-  const history = loadSyncHistory();
-  console.log(`📝 Previously synced: ${history.syncedIds.length} recordings\n`);
-  
-  // Get recordings from Plaud
-  const recordings = await getPlaudRecordings();
-  
-  // Filter out already synced recordings
-  const newRecordings = recordings.filter(r => !history.syncedIds.includes(r.id));
-  console.log(`\n📊 Found ${newRecordings.length} new recordings to sync\n`);
-  
-  if (newRecordings.length === 0) {
-    console.log('✨ No new recordings to sync!');
-    return;
-  }
-  
-  // Sync each new recording
-  let successCount = 0;
-  for (const recording of newRecordings) {
-    try {
-      await createNotionPage(recording);
-      history.syncedIds.push(recording.id);
-      successCount++;
-      
-      // Add a small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (error) {
-      console.error(`Failed to sync recording: ${recording.title}`);
-    }
-  }
-  
-  // Save updated history
-  saveSyncHistory(history);
-  
-  console.log(`\n✅ Sync complete! Successfully synced ${successCount}/${newRecordings.length} recordings`);
-}
-
-// Run the sync
-syncPlaudToNotion().catch((error) => {
-  console.error('❌ Sync failed:', error);
+main().catch((err) => {
+  console.error("Sync failed:", err?.stack || err?.message || err);
   process.exit(1);
 });
