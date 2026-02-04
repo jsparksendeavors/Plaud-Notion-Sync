@@ -336,12 +336,41 @@ async function writeRecordingToNotion(notion, databaseId, rec) {
     }
   }
 
-  await notion.pages.create({
-    parent: { database_id: databaseId },
-    properties: props,
-    children: children.length ? children : undefined,
-  });
-}
+await notion.pages.create({
+  parent: {
+    database_id: process.env.NOTION_DATABASE_ID
+  },
+  properties: {
+    Name: {
+      title: [
+        {
+          text: {
+            content: recording.title || recording.name || "Untitled Recording"
+          }
+        }
+      ]
+    },
+    Date: {
+      date: {
+        start: new Date(
+          recording.createdAt || recording.startTime
+        ).toISOString()
+      }
+    },
+    Summary: {
+      rich_text: [
+        {
+          text: {
+            content: recording.summary || ""
+          }
+        }
+      ]
+    },
+    Audio: {
+      url: recording.audioUrl || recording.audio_url || null
+    }
+  }
+})
 
 async function main() {
   console.log("Starting Plaud -> Notion sync...");
