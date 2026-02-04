@@ -35,7 +35,7 @@ jobs:
         env:
           PLAUD_EMAIL: ${{ secrets.PLAUD_EMAIL }}
           PLAUD_PASSWORD: ${{ secrets.PLAUD_PASSWORD }}
-          NOTION_API_KEY: ${{ secrets.NOTION_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: npm run sync
       
