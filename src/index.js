@@ -32,6 +32,25 @@ function normalizeDbId(input) {
   return onlyHex;
 }
 
+function recordingDisplayName(rec) {
+  const raw = String(rec?.title || "").trim();
+  if (raw && !/^plaud\s*recording$/i.test(raw)) return raw;
+
+  const d = toNotionDate(rec?.createdAt);
+  if (d) return `Plaud recording ${d.slice(0, 10)}`;
+
+  const shortId = String(rec?.id || "").slice(0, 8);
+  return shortId ? `Plaud recording ${shortId}` : "Plaud recording";
+}
+
+function buildPlaudRecordingUrl(baseUrl, rec) {
+  if (rec?.sourceUrl && /^https?:\/\//i.test(rec.sourceUrl)) return rec.sourceUrl;
+  const cleanedBase = String(baseUrl || "https://web.plaud.ai").replace(/\/$/, "");
+  if (!rec?.id) return cleanedBase;
+  // Best-effort deep link format used by Plaud web routes.
+  return `${cleanedBase}/recordings/${encodeURIComponent(String(rec.id))}`;
+}
+
 async function loadSyncedIds() {
   const fp = path.join(process.cwd(), "synced-recordings.json");
   try {
@@ -283,64 +302,138 @@ async function getPlaudRecordings(page) {
 }
 
 function toNotionDate(value) {
-  // Try to coerce into ISO date
   if (!value) return null;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString();
 }
 
-async function writeRecordingToNotion(notion, databaseId, rec) {
-  // This expects a Notion database that has these properties:
-  // Name (title), Date (date), Summary (rich_text), Source (rich_text or url)
-  // If yours differs, we can adapt it.
+function hasUsefulContent(rec) {
+  const summaryLen = (rec.summary || "").trim().length;
+  const transcriptLen = (rec.transcript || "").trim().length;
+  return summaryLen >= 40 || transcriptLen >= 120;
+}
+
+function buildNotionProperties(rec, baseUrl) {
   const props = {
     Name: {
-      title: [{ type: "text", text: { content: rec.title || "Plaud Recording" } }],
+      title: [{ type: "text", text: { content: recordingDisplayName(rec) } }],
     },
   };
 
-  const iso = toNotionDate(rec.createdAt);
-  if (iso) {
-    props.Date = { date: { start: iso } };
-  }
+  // Always set Date so records are sortable even when Plaud omits createdAt.
+  const iso = toNotionDate(rec.createdAt) || new Date().toISOString();
+  props.Date = { date: { start: iso } };
 
   if (rec.summary) {
     props.Summary = { rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }] };
   }
 
-  // Source can be stored as rich text if you have that property, or url if you set it that way.
-  // We default to rich_text because it is most common.
-  if (rec.sourceUrl || rec.id) {
-    const sourceText = rec.sourceUrl || `Plaud:${rec.id}`;
+  // Stable source marker + direct Plaud link for dedupe and navigation.
+  const plaudUrl = buildPlaudRecordingUrl(baseUrl, rec);
+  if (rec.id) {
+    const sourceText = `Plaud:${rec.id} | ${plaudUrl}`;
     props.Source = { rich_text: [{ type: "text", text: { content: sourceText.slice(0, 1900) } }] };
   }
 
+  return props;
+}
+
+function filterPropertiesForDatabase(properties, databasePropertyNames) {
+  const filtered = {};
+  for (const [k, v] of Object.entries(properties || {})) {
+    if (databasePropertyNames.has(k)) filtered[k] = v;
+  }
+  return filtered;
+}
+
+function buildTranscriptChildren(rec, baseUrl) {
   const children = [];
-  if (rec.transcript) {
+
+  const plaudUrl = buildPlaudRecordingUrl(baseUrl, rec);
+  children.push({
+    object: "block",
+    type: "paragraph",
+    paragraph: {
+      rich_text: [
+        { type: "text", text: { content: "Open in Plaud: " } },
+        { type: "text", text: { content: plaudUrl, link: { url: plaudUrl } } },
+      ],
+    },
+  });
+
+  if (!rec.transcript) return children;
+
+  children.push({
+    object: "block",
+    type: "heading_2",
+    heading_2: { rich_text: [{ type: "text", text: { content: "Transcript" } }] },
+  });
+
+  const t = rec.transcript;
+  const chunkSize = 1800;
+  for (let i = 0; i < t.length; i += chunkSize) {
     children.push({
       object: "block",
-      type: "heading_2",
-      heading_2: { rich_text: [{ type: "text", text: { content: "Transcript" } }] },
+      type: "paragraph",
+      paragraph: { rich_text: [{ type: "text", text: { content: t.slice(i, i + chunkSize) } }] },
     });
-    // Notion block text limit is strict, chunk it
-    const t = rec.transcript;
-    const chunkSize = 1800;
-    for (let i = 0; i < t.length; i += chunkSize) {
-      children.push({
-        object: "block",
-        type: "paragraph",
-        paragraph: { rich_text: [{ type: "text", text: { content: t.slice(i, i + chunkSize) } }] },
-      });
-      if (children.length > 90) break;
+    if (children.length > 90) break;
+  }
+
+  return children;
+}
+
+async function findExistingPageByPlaudId(notion, databaseId, plaudId) {
+  if (!plaudId) return null;
+
+  try {
+    const resp = await notion.databases.query({
+      database_id: databaseId,
+      filter: {
+        property: "Source",
+        rich_text: {
+          contains: `Plaud:${plaudId}`,
+        },
+      },
+      page_size: 1,
+    });
+
+    return resp.results?.[0] || null;
+  } catch {
+    // If database schema differs (e.g. no Source field), fail open.
+    return null;
+  }
+}
+
+async function writeRecordingToNotion(notion, databaseId, rec, baseUrl, dbPropertyNames) {
+  const properties = filterPropertiesForDatabase(buildNotionProperties(rec, baseUrl), dbPropertyNames);
+  const children = buildTranscriptChildren(rec, baseUrl);
+
+  const existing = await findExistingPageByPlaudId(notion, databaseId, rec.id);
+  if (existing?.id) {
+    await notion.pages.update({
+      page_id: existing.id,
+      properties,
+    });
+
+    // If transcript exists, append once only when we don't already have lots of blocks.
+    if (children.length) {
+      const oldBlocks = await notion.blocks.children.list({ block_id: existing.id, page_size: 10 });
+      if ((oldBlocks.results || []).length < 3) {
+        await notion.blocks.children.append({ block_id: existing.id, children });
+      }
     }
+
+    return "updated";
   }
 
   await notion.pages.create({
     parent: { database_id: databaseId },
-    properties: props,
+    properties,
     children: children.length ? children : undefined,
   });
+  return "created";
 }
 
 async function main() {
@@ -370,21 +463,38 @@ async function main() {
     const recordings = await getPlaudRecordings(page);
 
     const notion = new Client({ auth: notionApiKey });
+    const db = await notion.databases.retrieve({ database_id: notionDatabaseId });
+    const dbPropertyNames = new Set(Object.keys(db.properties || {}));
 
     let created = 0;
+    let updated = 0;
+    let skippedLowSignal = 0;
+
     for (const rec of recordings) {
       if (!rec?.id) continue;
-      if (synced.has(String(rec.id))) continue;
 
-      console.log(`Writing to Notion: ${rec.title} (${rec.id})`);
-      await writeRecordingToNotion(notion, notionDatabaseId, rec);
+      const alreadySynced = synced.has(String(rec.id));
+      const useful = hasUsefulContent(rec);
+
+      // If we've already seen it AND there's still no useful content, skip.
+      if (alreadySynced && !useful) continue;
+
+      // Don't mark junk records as synced; we'll try again on a later run when Plaud has processed more content.
+      if (!useful) {
+        skippedLowSignal += 1;
+        continue;
+      }
+
+      console.log(`Upserting Notion: ${rec.title} (${rec.id})`);
+      const mode = await writeRecordingToNotion(notion, notionDatabaseId, rec, baseUrl, dbPropertyNames);
       synced.add(String(rec.id));
-      created += 1;
+      if (mode === "created") created += 1;
+      if (mode === "updated") updated += 1;
     }
 
     await saveSyncedIds(synced);
 
-    console.log(`Done. Created ${created} new Notion pages.`);
+    console.log(`Done. Created ${created}, updated ${updated}, skipped low-signal ${skippedLowSignal}.`);
   } finally {
     await browser.close();
   }
