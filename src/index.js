@@ -314,6 +314,12 @@ function hasUsefulContent(rec) {
   return summaryLen >= 40 || transcriptLen >= 120;
 }
 
+function shouldUpsert(rec) {
+  // Always upsert if we have any identity/title/date/link value at all.
+  // This guarantees Name/Date/Plaud-link improvements apply even before summaries/transcripts are ready.
+  return Boolean(rec?.id || rec?.title || rec?.createdAt || rec?.sourceUrl);
+}
+
 function buildNotionProperties(rec, baseUrl) {
   const props = {
     Name: {
@@ -468,33 +474,28 @@ async function main() {
 
     let created = 0;
     let updated = 0;
-    let skippedLowSignal = 0;
+    let skipped = 0;
+    let lowSignal = 0;
 
     for (const rec of recordings) {
-      if (!rec?.id) continue;
-
-      const alreadySynced = synced.has(String(rec.id));
-      const useful = hasUsefulContent(rec);
-
-      // If we've already seen it AND there's still no useful content, skip.
-      if (alreadySynced && !useful) continue;
-
-      // Don't mark junk records as synced; we'll try again on a later run when Plaud has processed more content.
-      if (!useful) {
-        skippedLowSignal += 1;
+      if (!shouldUpsert(rec)) {
+        skipped += 1;
         continue;
       }
 
-      console.log(`Upserting Notion: ${rec.title} (${rec.id})`);
+      const useful = hasUsefulContent(rec);
+      if (!useful) lowSignal += 1;
+
+      console.log(`Upserting Notion: ${rec.title || "(untitled)"} (${rec.id || "no-id"})`);
       const mode = await writeRecordingToNotion(notion, notionDatabaseId, rec, baseUrl, dbPropertyNames);
-      synced.add(String(rec.id));
+      if (rec?.id) synced.add(String(rec.id));
       if (mode === "created") created += 1;
       if (mode === "updated") updated += 1;
     }
 
     await saveSyncedIds(synced);
 
-    console.log(`Done. Created ${created}, updated ${updated}, skipped low-signal ${skippedLowSignal}.`);
+    console.log(`Done. Created ${created}, updated ${updated}, low-signal ${lowSignal}, skipped ${skipped}.`);
   } finally {
     await browser.close();
   }
