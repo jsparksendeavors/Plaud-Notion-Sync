@@ -320,7 +320,7 @@ function shouldUpsert(rec) {
   return Boolean(rec?.id || rec?.title || rec?.createdAt || rec?.sourceUrl);
 }
 
-function buildNotionProperties(rec, baseUrl) {
+function buildNotionProperties(rec, baseUrl, dbProperties = {}) {
   const props = {
     Name: {
       title: [{ type: "text", text: { content: recordingDisplayName(rec) } }],
@@ -332,14 +332,24 @@ function buildNotionProperties(rec, baseUrl) {
   props.Date = { date: { start: iso } };
 
   if (rec.summary) {
-    props.Summary = { rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }] };
+    const summaryType = dbProperties?.Summary?.type;
+    if (!summaryType || summaryType === "rich_text") {
+      props.Summary = { rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }] };
+    }
   }
 
   // Stable source marker + direct Plaud link for dedupe and navigation.
   const plaudUrl = buildPlaudRecordingUrl(baseUrl, rec);
   if (rec.id) {
+    const sourceType = dbProperties?.Source?.type;
     const sourceText = `Plaud:${rec.id} | ${plaudUrl}`;
-    props.Source = { rich_text: [{ type: "text", text: { content: sourceText.slice(0, 1900) } }] };
+
+    if (sourceType === "url") {
+      props.Source = { url: plaudUrl };
+    } else {
+      // Default/fallback to rich_text for backwards compatibility.
+      props.Source = { rich_text: [{ type: "text", text: { content: sourceText.slice(0, 1900) } }] };
+    }
   }
 
   return props;
@@ -390,18 +400,32 @@ function buildTranscriptChildren(rec, baseUrl) {
   return children;
 }
 
-async function findExistingPageByPlaudId(notion, databaseId, plaudId) {
+async function findExistingPageByPlaudId(notion, databaseId, plaudId, dbProperties = {}, baseUrl = "https://web.plaud.ai") {
   if (!plaudId) return null;
 
   try {
-    const resp = await notion.databases.query({
-      database_id: databaseId,
-      filter: {
+    const sourceType = dbProperties?.Source?.type;
+    let filter = null;
+
+    if (sourceType === "url") {
+      filter = {
+        property: "Source",
+        url: {
+          equals: buildPlaudRecordingUrl(baseUrl, { id: plaudId }),
+        },
+      };
+    } else {
+      filter = {
         property: "Source",
         rich_text: {
           contains: `Plaud:${plaudId}`,
         },
-      },
+      };
+    }
+
+    const resp = await notion.databases.query({
+      database_id: databaseId,
+      filter,
       page_size: 1,
     });
 
@@ -412,11 +436,11 @@ async function findExistingPageByPlaudId(notion, databaseId, plaudId) {
   }
 }
 
-async function writeRecordingToNotion(notion, databaseId, rec, baseUrl, dbPropertyNames) {
-  const properties = filterPropertiesForDatabase(buildNotionProperties(rec, baseUrl), dbPropertyNames);
+async function writeRecordingToNotion(notion, databaseId, rec, baseUrl, dbPropertyNames, dbProperties) {
+  const properties = filterPropertiesForDatabase(buildNotionProperties(rec, baseUrl, dbProperties), dbPropertyNames);
   const children = buildTranscriptChildren(rec, baseUrl);
 
-  const existing = await findExistingPageByPlaudId(notion, databaseId, rec.id);
+  const existing = await findExistingPageByPlaudId(notion, databaseId, rec.id, dbProperties, baseUrl);
   if (existing?.id) {
     await notion.pages.update({
       page_id: existing.id,
@@ -470,7 +494,8 @@ async function main() {
 
     const notion = new Client({ auth: notionApiKey });
     const db = await notion.databases.retrieve({ database_id: notionDatabaseId });
-    const dbPropertyNames = new Set(Object.keys(db.properties || {}));
+    const dbProperties = db.properties || {};
+    const dbPropertyNames = new Set(Object.keys(dbProperties));
 
     let created = 0;
     let updated = 0;
@@ -487,7 +512,7 @@ async function main() {
       if (!useful) lowSignal += 1;
 
       console.log(`Upserting Notion: ${rec.title || "(untitled)"} (${rec.id || "no-id"})`);
-      const mode = await writeRecordingToNotion(notion, notionDatabaseId, rec, baseUrl, dbPropertyNames);
+      const mode = await writeRecordingToNotion(notion, notionDatabaseId, rec, baseUrl, dbPropertyNames, dbProperties);
       if (rec?.id) synced.add(String(rec.id));
       if (mode === "created") created += 1;
       if (mode === "updated") updated += 1;
