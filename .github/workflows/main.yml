@@ -45,5 +45,10 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add synced-recordings.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update sync history [skip ci]"
-          git push
+          if ! git diff --quiet || ! git diff --staged --quiet; then
+            git commit -m "Update sync history [skip ci]"
+            git pull --rebase origin main
+            git push
+          else
+            echo "No sync history changes to commit."
+          fi
