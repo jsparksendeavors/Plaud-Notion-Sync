@@ -286,7 +286,55 @@ function extractRecordingsFromApiJson(json) {
   return Array.from(map.values());
 }
 
-async function getPlaudRecordings(page) {
+function mergeRecording(baseRec, enrichRec) {
+  if (!enrichRec) return baseRec;
+  return {
+    ...baseRec,
+    title: firstNonEmptyString([enrichRec.title, baseRec.title]) || "Plaud Recording",
+    createdAt: enrichRec.createdAt ?? baseRec.createdAt,
+    summary: firstNonEmptyString([enrichRec.summary, baseRec.summary]),
+    transcript: firstNonEmptyString([enrichRec.transcript, baseRec.transcript]),
+    sourceUrl: firstNonEmptyString([enrichRec.sourceUrl, baseRec.sourceUrl]),
+  };
+}
+
+async function enrichRecordingFromDetailPage(page, baseUrl, rec) {
+  if (!rec?.id) return rec;
+
+  const detailCandidates = [];
+  const onResp = async (resp) => {
+    try {
+      const url = resp.url();
+      if (!/api|record|note|transcript|meeting/i.test(url)) return;
+      const json = await safeJson(resp);
+      if (!json) return;
+      const extracted = extractRecordingsFromApiJson(json);
+      for (const e of extracted) {
+        if (String(e.id) === String(rec.id)) detailCandidates.push(e);
+      }
+    } catch {
+      // ignore noisy responses
+    }
+  };
+
+  page.on("response", onResp);
+  try {
+    await page.goto(buildPlaudRecordingUrl(baseUrl, rec), { waitUntil: "networkidle2" });
+    await sleep(1500);
+  } catch {
+    // ignore navigation failures and return original record
+  } finally {
+    page.off("response", onResp);
+  }
+
+  let best = rec;
+  for (const c of detailCandidates) {
+    best = mergeRecording(best, c);
+  }
+  return best;
+}
+
+async function getPlaudRecordings(page, baseUrl) {
   console.log("Opening Plaud app area...");
   // Try to nudge app to a recordings area. We do not assume exact route.
   // Most apps expose something like /recordings or /notes. We attempt both.
@@ -327,6 +375,18 @@ async function getPlaudRecordings(page) {
   }
 
   if (recordings.length) {
+    // Enrich low-signal records by visiting detail pages for better summary/transcript fields.
+    const needsEnrichment = recordings.filter((r) => !hasUsefulContent(r));
+    if (needsEnrichment.length) {
+      console.log(`Enriching ${needsEnrichment.length} low-signal recordings from detail pages...`);
+      const byId = new Map(recordings.map((r) => [String(r.id), r]));
+      for (const rec of needsEnrichment) {
+        const enriched = await enrichRecordingFromDetailPage(page, baseUrl, rec);
+        byId.set(String(rec.id), mergeRecording(rec, enriched));
+      }
+      recordings = Array.from(byId.values());
+    }
+
     console.log(`Captured ${recordings.length} recordings from Plaud network responses.`);
     return recordings;
   }
@@ -575,7 +635,7 @@ async function main() {
 
     await loginToPlaud(page, baseUrl, plaudEmail, plaudPassword);
 
-    const recordings = await getPlaudRecordings(page);
+    const recordings = await getPlaudRecordings(page, baseUrl);
 
     const notion = new Client({ auth: notionApiKey });
     const db = await notion.databases.retrieve({ database_id: notionDatabaseId });
