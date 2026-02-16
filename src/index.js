@@ -173,6 +173,8 @@ function flattenText(value) {
       .trim();
   }
   if (typeof value === "object") {
+    // Only read explicit text-bearing keys. Do NOT recursively flatten arbitrary objects,
+    // which can pull unrelated UI/template metadata into summaries.
     const likely = [
       value.text,
       value.content,
@@ -184,15 +186,7 @@ function flattenText(value) {
       value.markdown,
       value.plain,
     ];
-    const direct = firstNonEmptyString(likely);
-    if (direct) return direct;
-
-    // Last resort: recurse shallowly through object values
-    return Object.values(value)
-      .map((v) => flattenText(v))
-      .filter(Boolean)
-      .join("\n")
-      .trim();
+    return firstNonEmptyString(likely);
   }
   return "";
 }
@@ -454,10 +448,24 @@ function toNotionDate(value) {
   return d.toISOString();
 }
 
+function isTemplateNoise(text) {
+  const t = String(text || "").toLowerCase();
+  if (!t) return false;
+  const markers = [
+    "account_circle_rounded",
+    "task_alt_rounded",
+    "detailed summary",
+    "full transcript (for external use)",
+  ];
+  return markers.some((m) => t.includes(m));
+}
+
 function hasUsefulContent(rec) {
-  const summaryLen = (rec.summary || "").trim().length;
+  const summary = (rec.summary || "").trim();
+  const summaryLen = summary.length;
   const transcriptLen = (rec.transcript || "").trim().length;
-  return summaryLen >= 40 || transcriptLen >= 120;
+  const goodSummary = summaryLen >= 40 && !isTemplateNoise(summary);
+  return goodSummary || transcriptLen >= 120;
 }
 
 function shouldUpsert(rec) {
@@ -692,11 +700,15 @@ async function main() {
 
       const normalizedSummary = (rec.summary || "").trim();
       if (normalizedSummary) {
-        const count = (seenSummaries.get(normalizedSummary) || 0) + 1;
-        seenSummaries.set(normalizedSummary, count);
-        // If same summary appears for many recordings in one run, treat as bad extraction.
-        if (count >= 3) {
+        if (isTemplateNoise(normalizedSummary)) {
           rec.summary = "";
+        } else {
+          const count = (seenSummaries.get(normalizedSummary) || 0) + 1;
+          seenSummaries.set(normalizedSummary, count);
+          // If same summary appears for many recordings in one run, treat as bad extraction.
+          if (count >= 3) {
+            rec.summary = "";
+          }
         }
       }
 
