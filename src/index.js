@@ -465,6 +465,18 @@ function shouldUpsert(rec) {
   return Boolean(rec?.id || rec?.title || rec?.createdAt || rec?.sourceUrl);
 }
 
+function pickSummaryPropertyName(dbProperties = {}) {
+  const candidates = ["Summary", "Meeting Minutes", "Meeting Notes", "Notes"];
+  for (const name of candidates) {
+    if (dbProperties?.[name]?.type === "rich_text") return name;
+  }
+  // fallback: first rich_text property that isn't Source
+  for (const [name, meta] of Object.entries(dbProperties || {})) {
+    if (name !== "Source" && meta?.type === "rich_text") return name;
+  }
+  return null;
+}
+
 function buildNotionProperties(rec, baseUrl, dbProperties = {}) {
   const props = {
     Name: {
@@ -477,9 +489,11 @@ function buildNotionProperties(rec, baseUrl, dbProperties = {}) {
   props.Date = { date: { start: iso } };
 
   if (rec.summary) {
-    const summaryType = dbProperties?.Summary?.type;
-    if (!summaryType || summaryType === "rich_text") {
-      props.Summary = { rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }] };
+    const summaryPropName = pickSummaryPropertyName(dbProperties);
+    if (summaryPropName) {
+      props[summaryPropName] = {
+        rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }],
+      };
     }
   }
 
@@ -522,6 +536,25 @@ function buildTranscriptChildren(rec, baseUrl) {
       ],
     },
   });
+
+  if (rec.summary) {
+    children.push({
+      object: "block",
+      type: "heading_2",
+      heading_2: { rich_text: [{ type: "text", text: { content: "Summary" } }] },
+    });
+
+    const s = rec.summary;
+    const chunkSize = 1800;
+    for (let i = 0; i < s.length; i += chunkSize) {
+      children.push({
+        object: "block",
+        type: "paragraph",
+        paragraph: { rich_text: [{ type: "text", text: { content: s.slice(i, i + chunkSize) } }] },
+      });
+      if (children.length > 50) break;
+    }
+  }
 
   if (!rec.transcript) return children;
 
