@@ -155,6 +155,48 @@ async function loginToPlaud(page, baseUrl, email, password) {
   console.log("Login step completed. Proceeding...");
 }
 
+function firstNonEmptyString(values) {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+function flattenText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((v) => flattenText(v))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  if (typeof value === "object") {
+    const likely = [
+      value.text,
+      value.content,
+      value.value,
+      value.summary,
+      value.brief,
+      value.transcript,
+      value.description,
+      value.markdown,
+      value.plain,
+    ];
+    const direct = firstNonEmptyString(likely);
+    if (direct) return direct;
+
+    // Last resort: recurse shallowly through object values
+    return Object.values(value)
+      .map((v) => flattenText(v))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
 function extractRecordingsFromApiJson(json) {
   // We do not know Plaud schema exactly, so we check common shapes.
   // Return array of { id, title, createdAt, summary, sourceUrl, transcript }
@@ -175,29 +217,72 @@ function extractRecordingsFromApiJson(json) {
   for (const arr of maybeArrays) {
     for (const r of arr) {
       if (!r || typeof r !== "object") continue;
-      const id = r.id ?? r.recordingId ?? r.uuid ?? r._id;
+      const id = r.id ?? r.recordingId ?? r.recording_id ?? r.uuid ?? r._id;
       if (!id) continue;
 
-      const title = r.title ?? r.name ?? r.recordingName ?? "Plaud Recording";
-      const createdAt = r.createdAt ?? r.created_at ?? r.time ?? r.date ?? null;
-      const summary = r.summary ?? r.brief ?? r.aiSummary ?? "";
-      const transcript = r.transcript ?? r.text ?? r.content ?? "";
-      const sourceUrl = r.url ?? r.webUrl ?? r.shareUrl ?? "";
+      const title = firstNonEmptyString([
+        r.title,
+        r.name,
+        r.recordingName,
+        r.recordingTitle,
+        r.record_title,
+        r.fileName,
+        r.filename,
+        r.subject,
+      ]) || "Plaud Recording";
+
+      const createdAt =
+        r.createdAt ??
+        r.created_at ??
+        r.createTime ??
+        r.createdTime ??
+        r.time ??
+        r.date ??
+        null;
+
+      const summary = firstNonEmptyString([
+        flattenText(r.summary),
+        flattenText(r.brief),
+        flattenText(r.aiSummary),
+        flattenText(r.ai_summary),
+        flattenText(r.abstract),
+        flattenText(r.notes),
+      ]);
+
+      const transcript = firstNonEmptyString([
+        flattenText(r.transcript),
+        flattenText(r.text),
+        flattenText(r.content),
+        flattenText(r.fullText),
+        flattenText(r.full_text),
+      ]);
+
+      const sourceUrl = firstNonEmptyString([r.url, r.webUrl, r.shareUrl, r.link]);
 
       candidates.push({
         id: String(id),
         title: String(title),
         createdAt,
-        summary: summary ? String(summary) : "",
-        transcript: transcript ? String(transcript) : "",
+        summary,
+        transcript,
         sourceUrl: sourceUrl ? String(sourceUrl) : "",
       });
     }
   }
 
-  // Deduplicate by id
+  // Deduplicate by id, preferring the richest record when duplicates appear
   const map = new Map();
-  for (const c of candidates) map.set(c.id, c);
+  for (const c of candidates) {
+    const prev = map.get(c.id);
+    if (!prev) {
+      map.set(c.id, c);
+      continue;
+    }
+
+    const prevScore = (prev.summary || "").length + (prev.transcript || "").length + (prev.title || "").length;
+    const nextScore = (c.summary || "").length + (c.transcript || "").length + (c.title || "").length;
+    if (nextScore >= prevScore) map.set(c.id, c);
+  }
   return Array.from(map.values());
 }
 
