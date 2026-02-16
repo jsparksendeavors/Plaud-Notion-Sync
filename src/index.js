@@ -298,35 +298,6 @@ function mergeRecording(baseRec, enrichRec) {
   };
 }
 
-async function extractSummaryFromDetailDom(page) {
-  try {
-    const txt = await page.evaluate(() => {
-      const rootText = (document.body?.innerText || "").replace(/\r/g, "");
-      const marker = /Meeting Notes/i;
-      const idx = rootText.search(marker);
-      if (idx === -1) return "";
-
-      const after = rootText.slice(idx + "Meeting Notes".length).trim();
-      // Trim chat prompt and other app chrome if present
-      const stopMarkers = ["Ask Plaud about this note", "Sources", "Notes", "Meeting Minutes"];
-      let clipped = after;
-      for (const m of stopMarkers) {
-        const p = clipped.indexOf(m);
-        if (p > 200) {
-          clipped = clipped.slice(0, p).trim();
-          break;
-        }
-      }
-
-      return clipped;
-    });
-
-    return (txt || "").trim();
-  } catch {
-    return "";
-  }
-}
-
 async function enrichRecordingFromDetailPage(page, baseUrl, rec) {
   if (!rec?.id) return rec;
 
@@ -347,11 +318,9 @@ async function enrichRecordingFromDetailPage(page, baseUrl, rec) {
   };
 
   page.on("response", onResp);
-  let domSummary = "";
   try {
     await page.goto(buildPlaudRecordingUrl(baseUrl, rec), { waitUntil: "networkidle2" });
     await sleep(1800);
-    domSummary = await extractSummaryFromDetailDom(page);
   } catch {
     // ignore navigation failures and return original record
   } finally {
@@ -361,10 +330,6 @@ async function enrichRecordingFromDetailPage(page, baseUrl, rec) {
   let best = rec;
   for (const c of detailCandidates) {
     best = mergeRecording(best, c);
-  }
-
-  if (!best.summary && domSummary) {
-    best.summary = domSummary;
   }
 
   return best;
@@ -716,10 +681,23 @@ async function main() {
     let skipped = 0;
     let lowSignal = 0;
 
+    // Safety: if one bad summary string appears repeatedly, don't propagate it.
+    const seenSummaries = new Map();
+
     for (const rec of recordings) {
       if (!shouldUpsert(rec)) {
         skipped += 1;
         continue;
+      }
+
+      const normalizedSummary = (rec.summary || "").trim();
+      if (normalizedSummary) {
+        const count = (seenSummaries.get(normalizedSummary) || 0) + 1;
+        seenSummaries.set(normalizedSummary, count);
+        // If same summary appears for many recordings in one run, treat as bad extraction.
+        if (count >= 3) {
+          rec.summary = "";
+        }
       }
 
       const useful = hasUsefulContent(rec);
