@@ -456,6 +456,8 @@ function isTemplateNoise(text) {
     "task_alt_rounded",
     "detailed summary",
     "full transcript (for external use)",
+    "faithful and complete audio transcription",
+    "extract meeting tasks and decisions",
   ];
   return markers.some((m) => t.includes(m));
 }
@@ -497,12 +499,15 @@ function buildNotionProperties(rec, baseUrl, dbProperties = {}) {
   const iso = toNotionDate(rec.createdAt) || new Date().toISOString();
   props.Date = { date: { start: iso } };
 
-  if (rec.summary) {
-    const summaryPropName = pickSummaryPropertyName(dbProperties);
-    if (summaryPropName) {
+  const summaryPropName = pickSummaryPropertyName(dbProperties);
+  if (summaryPropName) {
+    if (rec.summary) {
       props[summaryPropName] = {
         rich_text: [{ type: "text", text: { content: rec.summary.slice(0, 1900) } }],
       };
+    } else if (rec._clearSummary === true) {
+      // Explicitly clear known-bad template noise from prior runs.
+      props[summaryPropName] = { rich_text: [] };
     }
   }
 
@@ -702,12 +707,14 @@ async function main() {
       if (normalizedSummary) {
         if (isTemplateNoise(normalizedSummary)) {
           rec.summary = "";
+          rec._clearSummary = true;
         } else {
           const count = (seenSummaries.get(normalizedSummary) || 0) + 1;
           seenSummaries.set(normalizedSummary, count);
           // If same summary appears for many recordings in one run, treat as bad extraction.
           if (count >= 3) {
             rec.summary = "";
+            rec._clearSummary = true;
           }
         }
       }
