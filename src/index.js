@@ -6,6 +6,7 @@ import { Client } from "@notionhq/client";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PLAUD_DEBUG = String(process.env.PLAUD_DEBUG || "false").toLowerCase() === "true";
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -253,6 +254,22 @@ function extractRecordingsFromApiJson(json) {
 
       const sourceUrl = firstNonEmptyString([r.url, r.webUrl, r.shareUrl, r.link]);
 
+      const summaryCandidates = [
+        flattenText(r.summary),
+        flattenText(r.brief),
+        flattenText(r.aiSummary),
+        flattenText(r.ai_summary),
+        flattenText(r.abstract),
+        flattenText(r.notes),
+      ];
+      const transcriptCandidates = [
+        flattenText(r.transcript),
+        flattenText(r.text),
+        flattenText(r.content),
+        flattenText(r.fullText),
+        flattenText(r.full_text),
+      ];
+
       candidates.push({
         id: String(id),
         title: String(title),
@@ -260,6 +277,13 @@ function extractRecordingsFromApiJson(json) {
         summary,
         transcript,
         sourceUrl: sourceUrl ? String(sourceUrl) : "",
+        _debug: PLAUD_DEBUG
+          ? {
+              rawKeys: Object.keys(r).slice(0, 40),
+              summaryLens: summaryCandidates.map((x) => (x || "").length),
+              transcriptLens: transcriptCandidates.map((x) => (x || "").length),
+            }
+          : undefined,
       });
     }
   }
@@ -683,6 +707,19 @@ async function main() {
     await loginToPlaud(page, baseUrl, plaudEmail, plaudPassword);
 
     const recordings = await getPlaudRecordings(page, baseUrl);
+
+    if (PLAUD_DEBUG) {
+      console.log(`DEBUG: extracted ${recordings.length} recordings`);
+      for (const rec of recordings.slice(0, 8)) {
+        const d = rec._debug || {};
+        console.log(
+          `DEBUG_REC id=${rec.id} title=${JSON.stringify(rec.title)} summaryLen=${(rec.summary || "").length} transcriptLen=${(rec.transcript || "").length}`
+        );
+        if (d.rawKeys) console.log(`DEBUG_KEYS ${rec.id}: ${d.rawKeys.join(",")}`);
+        if (d.summaryLens) console.log(`DEBUG_SUMMARY_LENS ${rec.id}: ${d.summaryLens.join(",")}`);
+        if (d.transcriptLens) console.log(`DEBUG_TRANSCRIPT_LENS ${rec.id}: ${d.transcriptLens.join(",")}`);
+      }
+    }
 
     const notion = new Client({ auth: notionApiKey });
     const db = await notion.databases.retrieve({ database_id: notionDatabaseId });

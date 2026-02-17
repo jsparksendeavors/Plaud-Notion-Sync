@@ -8,6 +8,11 @@ on:
   
   # Allow manual triggering
   workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable Plaud payload debug logging"
+        required: false
+        default: "false"
 
 jobs:
   sync:
@@ -38,6 +43,7 @@ jobs:
           PLAUD_PASSWORD: ${{ secrets.PLAUD_PASSWORD }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          PLAUD_DEBUG: ${{ github.event.inputs.debug || 'false' }}
         run: npm run sync
       
       - name: Commit sync history
